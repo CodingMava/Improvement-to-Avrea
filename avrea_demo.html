@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Avrea - Pipeline Bottleneck Teardown</title>
+    <style>
+        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #0d1117; color: #c9d1d9; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
+        header { padding: 20px 40px; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; background: #161b22; }
+        h1 { margin: 0; font-size: 24px; font-weight: 600; color: #58a6ff; }
+        .controls { display: flex; gap: 20px; align-items: center; }
+        .toggle-btn { background: #238636; color: white; border: none; padding: 10px 20px; border-radius: 6px; font-size: 16px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+        .toggle-btn.off { background: #da3633; }
+        .metrics { display: flex; gap: 40px; padding: 15px 40px; background: #0d1117; border-bottom: 1px solid #30363d; z-index: 10; relative; }
+        .metric-box { display: flex; flex-direction: column; }
+        .metric-label { font-size: 12px; text-transform: uppercase; color: #8b949e; font-weight: 600; }
+        .metric-value { font-size: 28px; font-weight: bold; font-variant-numeric: tabular-nums; }
+        #cost { color: #ff7b72; }
+        #queue { color: #d2a8ff; }
+        
+        /* New Canvas Container & Legend Styles */
+        .canvas-container { position: relative; flex-grow: 1; width: 100%; }
+        canvas { width: 100%; height: 100%; display: block; }
+        
+        .legend {
+            position: absolute;
+            bottom: 40px;
+            left: 40px;
+            background: rgba(22, 27, 34, 0.9);
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 15px 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            backdrop-filter: blur(4px);
+        }
+        .legend-title { font-size: 12px; text-transform: uppercase; color: #8b949e; font-weight: 600; margin-bottom: 12px; letter-spacing: 0.5px; }
+        .legend-item { display: flex; align-items: center; margin-bottom: 10px; font-size: 14px; color: #c9d1d9; }
+        .legend-item:last-child { margin-bottom: 0; }
+        .dot { border-radius: 50%; margin-right: 12px; flex-shrink: 0; }
+        .dot.ai { width: 8px; height: 8px; background: #58a6ff; box-shadow: 0 0 6px #58a6ff; }
+        .dot.human { width: 12px; height: 12px; background: #ffffff; box-shadow: 0 0 6px #ffffff; }
+        .dot.rejected { width: 8px; height: 8px; background: #ff7b72; box-shadow: 0 0 6px #ff7b72; }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div>
+            <h1>🚦 Avrea: Pipeline Teardown</h1>
+            <p style="margin: 5px 0 0 0; color: #8b949e; font-size: 14px;">Visualizing AI Agent CI/CD Deadlocks vs. Fast-Fail Routing</p>
+        </div>
+        <div class="controls">
+            <span>Avrea Smart Router:</span>
+            <button id="routerToggle" class="toggle-btn off">System OFF (Bottlenecking)</button>
+        </div>
+    </header>
+
+    <div class="metrics">
+        <div class="metric-box">
+            <span class="metric-label">E2E Queue Deadlock Size</span>
+            <span class="metric-value" id="queue">0 commits</span>
+        </div>
+        <div class="metric-box">
+            <span class="metric-label">Compute Cost Wasted</span>
+            <span class="metric-value" id="cost">$0.00</span>
+        </div>
+        <div class="metric-box">
+            <span class="metric-label">Successful Deployments</span>
+            <span class="metric-value" id="deploys" style="color: #3fb950;">0</span>
+        </div>
+    </div>
+
+    <div class="canvas-container">
+        <!-- Floating Visual Key -->
+        <div class="legend">
+            <div class="legend-title">Visual Key</div>
+            <div class="legend-item"><div class="dot ai"></div> AI Agent Micro-Commit (Fast/Spam)</div>
+            <div class="legend-item"><div class="dot human"></div> Human Developer Commit</div>
+            <div class="legend-item"><div class="dot rejected"></div> Dropped by Avrea (Saved Compute)</div>
+        </div>
+        
+        <canvas id="pipelineCanvas"></canvas>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('pipelineCanvas');
+        const ctx = canvas.getContext('2d');
+        const container = document.querySelector('.canvas-container');
+        let width, height;
+
+        // System State
+        let routerActive = false;
+        let queueSize = 0;
+        let computeCost = 0;
+        let deployments = 0;
+        let particles = [];
+        
+        // DOM Elements
+        const toggleBtn = document.getElementById('routerToggle');
+        const queueEl = document.getElementById('queue');
+        const costEl = document.getElementById('cost');
+        const deploysEl = document.getElementById('deploys');
+
+        function resize() {
+            width = canvas.width = container.clientWidth;
+            height = canvas.height = container.clientHeight;
+        }
+        window.addEventListener('resize', resize);
+        resize(); // Initial sizing
+
+        toggleBtn.addEventListener('click', () => {
+            routerActive = !routerActive;
+            toggleBtn.className = routerActive ? 'toggle-btn' : 'toggle-btn off';
+            toggleBtn.innerText = routerActive ? 'System ON (Fast-Failing)' : 'System OFF (Bottlenecking)';
+            if(routerActive) { queueSize = Math.max(0, queueSize - 10); } // Quick flush effect when turning on
+        });
+
+        class Commit {
+            constructor() {
+                this.x = 0;
+                this.y = height / 2 + (Math.random() * 60 - 30);
+                this.speed = Math.random() * 2 + 3;
+                this.isAgent = Math.random() > 0.1; // 90% are rapid AI commits
+                this.color = this.isAgent ? '#58a6ff' : '#ffffff';
+                this.radius = this.isAgent ? 4 : 6;
+                this.state = 'moving'; // moving, queued, rejected
+            }
+
+            update() {
+                if (this.state === 'moving') {
+                    this.x += this.speed;
+
+                    // Hit the router / queue entrance at 60% of screen
+                    if (this.x > width * 0.6) {
+                        if (routerActive && this.isAgent) {
+                            // 85% of agent commits fail the fast AST check and are dropped instantly
+                            if (Math.random() > 0.15) {
+                                this.state = 'rejected';
+                            } else {
+                                this.state = 'queued';
+                                queueSize++;
+                            }
+                        } else {
+                            this.state = 'queued';
+                            queueSize++;
+                        }
+                    }
+                } else if (this.state === 'rejected') {
+                    this.y += 6; // Fall down to simulate being dropped out of the pipeline
+                    this.color = '#ff7b72'; // Red for rejected
+                }
+            }
+
+            draw() {
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fillStyle = this.color;
+                
+                // Add a subtle glow
+                ctx.shadowBlur = 6;
+                ctx.shadowColor = this.color;
+                
+                ctx.fill();
+                
+                // Reset shadow so it doesn't affect other drawings
+                ctx.shadowBlur = 0;
+            }
+        }
+
+        // Spawn commits
+        setInterval(() => {
+            // AI Agents spam commits
+            for(let i=0; i<3; i++) particles.push(new Commit());
+        }, 150); 
+
+        // E2E Runner Processing (The Bottleneck - processes 1 commit at a time slowly)
+        setInterval(() => {
+            if (queueSize > 0) {
+                queueSize--;
+                deployments++;
+                deploysEl.innerText = deployments;
+            }
+        }, 1000); // 1 second to process 1 commit
+
+        function animate() {
+            // Clear canvas
+            ctx.clearRect(0, 0, width, height);
+
+            // Draw Architecture lines
+            ctx.strokeStyle = '#30363d';
+            ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.moveTo(0, height / 2);
+            ctx.lineTo(width * 0.6, height / 2);
+            ctx.stroke();
+
+            // Draw Router/Queue Box
+            ctx.fillStyle = routerActive ? 'rgba(35, 134, 54, 0.15)' : 'rgba(218, 54, 51, 0.15)';
+            ctx.strokeStyle = routerActive ? '#238636' : '#da3633';
+            ctx.lineWidth = 2;
+            
+            // Draw box with rounded corners
+            ctx.beginPath();
+            ctx.roundRect(width * 0.6, height / 2 - 60, 180, 120, 8);
+            ctx.fill();
+            ctx.stroke();
+            
+            // Label for the box
+            ctx.fillStyle = '#c9d1d9';
+            ctx.font = 'bold 14px sans-serif';
+            ctx.fillText(routerActive ? 'Avrea Gate (Active)' : 'Standard CI Queue', width * 0.6 + 15, height / 2 - 75);
+
+            // Update and draw particles
+            particles.forEach((p, index) => {
+                p.update();
+                p.draw();
+                // Remove off-screen particles
+                if (p.x > width || p.y > height) {
+                    particles.splice(index, 1);
+                }
+            });
+
+            // Update Metrics
+            if (queueSize > 15 && !routerActive) {
+                computeCost += queueSize * 0.05; // Cost spikes exponentially when deadlocked
+            }
+            
+            queueEl.innerText = queueSize + ' pending';
+            queueEl.style.color = queueSize > 20 ? '#ff7b72' : '#d2a8ff';
+            costEl.innerText = '$' + computeCost.toFixed(2);
+
+            requestAnimationFrame(animate);
+        }
+
+        animate();
+    </script>
+</body>
+</html>
